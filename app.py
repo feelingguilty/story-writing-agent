@@ -11,6 +11,10 @@ from agents.concept_agent import ConceptAgent
 from agents.character_agent import CharacterCrafterAgent
 from agents.script_agent import ScriptSmithAgent
 # Note: call_groq is used within agents, no direct import needed here normally
+from google import genai
+from google.genai import types
+from PIL import Image
+from io import BytesIO
 
 # --- Constants and Initial Setup ---
 DEFAULT_PROJECT_STATE = {
@@ -604,7 +608,22 @@ with tab3:
             else: st.warning("Not enough script content to analyze meaningfully.")
         st.markdown(get_state().get("script", {}).get("analysis_md", "*No analysis performed yet.*"))
 
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
+
+def generate_image_from_prod(prompt):
+    response = client.models.generate_content(
+            model="gemini-2.0-flash-exp-image-generation",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_modalities=['IMAGE','TEXT'])
+        )
+    for part in response.candidates[0].content.parts:
+        if part.text is not None:
+            st.write(part.text)
+        elif part.inline_data is not None:
+            image = Image.open(BytesIO(part.inline_data.data))
+            st.image(image, use_column_width=True)
+            
 # --- Tab 4: Pre-Production Ideas ---
 with tab4:
     st.header("Pre-Production Ideas")
@@ -619,18 +638,47 @@ with tab4:
             theme = state["concept"].get("chosen_theme", "")
             genre = state["concept"].get("seed_idea", "")
             synopsis = state["concept"].get("final_synopsis", state["concept"].get("chosen_logline",""))
-            if theme or genre or synopsis:
-                with st.spinner("AI is brainstorming visuals..."):
-                    result = script_agent.generate_moodboard_ideas(theme, genre, synopsis)
-                if "Error:" in result: st.error(result); update_log(f"Moodboard generation FAILED: {result}")
+        if theme or genre or synopsis:
+            with st.spinner("AI is brainstorming visuals..."):
+                text_result = script_agent.generate_moodboard_ideas(theme, genre, synopsis)
+            
+            if "Error:" in text_result:
+                st.error(text_result)
+                update_log(f"Moodboard generation FAILED: {text_result}")
+            else:
+                idea_list = text_result.split("\n")  # Assuming ideas are separated by new lines
+                idea_list = [idea.strip() for idea in idea_list if idea.strip()]
+
+                images = []
+                with st.spinner("AI is drawing moodboard images..."):
+                    for idea in idea_list:
+                        img = generate_image_from_prod(idea)
+                        images.append((idea, img))
+
+                state["pre_production"]["moodboard_ideas_md"] = text_result
+                state["pre_production"]["moodboard_images"] = images
+                update_log("Moodboard ideas and images generated.")
+                st.success("Moodboard ideas generated.")
+                st.rerun()
+        else:
+            st.warning("Provide Theme, Genre (Seed Idea), or Synopsis.")
+
+    # After markdown, display images with their text
+    moodboard_data = get_state().get("pre_production", {}).get("moodboard_images", [])
+    if moodboard_data:
+        col1, col2 = st.columns(2)
+        with col1:
+            for idx, (idea_text, img) in enumerate(moodboard_data[:len(moodboard_data)//2]):
+                if img:
+                    st.image(img, caption=idea_text, use_column_width=True)
                 else:
-                    state["pre_production"]["moodboard_ideas_md"] = result
-                    update_log("Moodboard ideas generated.")
-                    st.success("Moodboard ideas generated.")
-                    # Rerun needed
-                    st.rerun()
-            else: st.warning("Provide Theme, Genre (Seed Idea), or Synopsis.")
-        st.markdown(get_state().get("pre_production",{}).get("moodboard_ideas_md", "*No moodboard ideas generated yet.*"))
+                    st.warning(f"Could not generate image for: {idea_text}")
+        with col2:
+            for idx, (idea_text, img) in enumerate(moodboard_data[len(moodboard_data)//2:]):
+                if img:
+                    st.image(img, caption=idea_text, use_column_width=True)
+                else:
+                    st.warning(f"Could not generate image for: {idea_text}")
 
     with col2:
         st.subheader("Storyboard Shot Ideas")
@@ -639,18 +687,47 @@ with tab4:
             if scene_text_for_sb.strip():
                 update_log("Generating storyboard ideas...")
                 with st.spinner("AI is visualizing shots..."):
-                     result = script_agent.generate_storyboard_shot_ideas(scene_text_for_sb)
-                if "Error:" in result: st.error(result); update_log(f"Storyboard generation FAILED: {result}")
+                    text_result = script_agent.generate_storyboard_shot_ideas(scene_text_for_sb)
+
+                if "Error:" in text_result:
+                    st.error(text_result)
+                    update_log(f"Storyboard generation FAILED: {text_result}")
                 else:
-                     # Store result directly in state this time
-                     get_state()["pre_production"]["storyboard_ideas_md"] = result
-                     update_log("Storyboard ideas generated.")
-                     st.success("Storyboard ideas generated.")
-                     # Clear input area after generation?
-                     st.session_state.sb_scene_input = ""
-                     st.rerun() # Rerun needed
-            else: st.warning("Please paste scene text.")
-        st.markdown(get_state().get("pre_production",{}).get("storyboard_ideas_md", "*No storyboard ideas generated yet.*"))
+                    idea_list = text_result.split("\n")
+                    idea_list = [idea.strip() for idea in idea_list if idea.strip()]
+
+                    images = []
+                    with st.spinner("AI is drawing storyboard images..."):
+                        for idea in idea_list:
+                            img = generate_image_from_prod(idea)
+                            images.append((idea, img))
+
+                    get_state()["pre_production"]["storyboard_ideas_md"] = text_result
+                    get_state()["pre_production"]["storyboard_images"] = images
+                    update_log("Storyboard ideas and images generated.")
+                    st.success("Storyboard ideas generated.")
+                    st.session_state.sb_scene_input = ""
+                    st.rerun()
+            else:
+                st.warning("Please paste scene text.")
+
+        # After storyboard markdown, display images with their text
+        storyboard_data = get_state().get("pre_production", {}).get("storyboard_images", [])
+        if storyboard_data:
+            col1, col2 = st.columns(2)
+            with col1:
+                for idx, (idea_text, img) in enumerate(storyboard_data[:len(storyboard_data)//2]):
+                    if img:
+                        st.image(img, caption=idea_text, use_column_width=True)
+                    else:
+                        st.warning(f"Could not generate image for: {idea_text}")
+            with col2:
+                for idx, (idea_text, img) in enumerate(storyboard_data[len(storyboard_data)//2:]):
+                    if img:
+                        st.image(img, caption=idea_text, use_column_width=True)
+                    else:
+                        st.warning(f"Could not generate image for: {idea_text}")
+
 
 
 # --- Tab 5: Log ---
