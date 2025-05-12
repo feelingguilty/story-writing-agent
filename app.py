@@ -1,741 +1,871 @@
 # streamlit_app.py
 import streamlit as st
-import os
+import requests
 import json
-from datetime import datetime
-import copy # To deep copy default state
-
-# --- Project Imports ---
-import config # Ensure config.py is in the same directory or PYTHONPATH
-from agents.concept_agent import ConceptAgent
-from agents.character_agent import CharacterCrafterAgent
-from agents.script_agent import ScriptSmithAgent
-# Note: call_groq is used within agents, no direct import needed here normally
-from google import genai
-from google.genai import types
+import base64
+import io
 from PIL import Image
-from io import BytesIO
+from datetime import datetime # Used for displaying timestamps
+import logging
 
-# --- Constants and Initial Setup ---
-DEFAULT_PROJECT_STATE = {
-    "project_name": "Untitled", # Will store the display name (potentially uncleaned)
-    "cleaned_name": "untitled", # For internal file/dir usage
-    "current_phase": "Concept", # Could track active tab
-    "concept": { "seed_idea": "", "generated_concepts_md": "", "chosen_logline": "", "chosen_framework": "Three-Act Structure", "chosen_theme": "", "chosen_conflict": "", "synopsis_md": "", "final_synopsis": "" },
-    "characters": {},
-    "script": { "outline_md": "", "full_script_content": "", "analysis_md": "" },
-    "pre_production": { "moodboard_ideas_md": "", "storyboard_ideas_md": "" },
-    "last_saved": None,
-    "log": ["Project state initialized."]
-}
+# Configure basic logging for the Streamlit app (optional, for debugging server-side)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- Helper Functions (Adapted for Streamlit) ---
+# --- Configuration ---
+# IMPORTANT: Replace with your FastAPI server URL if it's not running locally
+API_BASE_URL = "http://127.0.0.1:8000" # Default local development URL
 
-def get_project_list():
-    """Returns a list of existing project names (directory names)."""
-    projects = []
-    if os.path.exists(config.PROJECTS_BASE_DIR):
-        for item in os.listdir(config.PROJECTS_BASE_DIR):
-            project_dir = os.path.join(config.PROJECTS_BASE_DIR, item)
-            if os.path.isdir(project_dir):
-                # Check if a state file exists (using cleaned name convention)
-                clean_name = item.strip().replace(" ", "_").lower()
-                state_file = os.path.join(project_dir, f"{clean_name}_state.json")
-                if os.path.exists(state_file):
-                     projects.append(item) # Return original directory name
-    return sorted(projects) if projects else []
+# --- Helper Functions for API Interaction ---
 
-def _get_project_state_path(project_name_display):
-    """Gets the path to the project's state file using display name."""
-    if not project_name_display: return None
-    project_dir = os.path.join(config.PROJECTS_BASE_DIR, project_name_display)
-    clean_name = project_name_display.strip().replace(" ", "_").lower()
-    return os.path.join(project_dir, f"{clean_name}_state.json")
+def call_api(method: str, endpoint: str, json_data: dict = None):
+    """Generic helper to call the FastAPI backend."""
+    # Ensure endpoint starts with a slash if not already
+    formatted_endpoint = endpoint if endpoint.startswith('/') else '/' + endpoint
+    url = f"{API_BASE_URL}{formatted_endpoint}"
+    try:
+        logger.info(f"Calling API: {method} {url}")
+        response = requests.request(method, url, json=json_data)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        logger.info(f"API call successful: {method} {url}")
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        status_code = e.response.status_code if e.response else 'Unknown'
+        error_message = f"API Error ({status_code}): {e}"
+        logger.error(error_message, exc_info=True) # Log the full exception
 
-def save_project_state():
-    """Saves the current st.session_state.project_state to its file."""
-    state = st.session_state.project_state
-    if not state or state.get("project_name", "Untitled") == "Untitled":
-        st.error("Cannot save an unnamed project. Create or load a project first.")
+        # Attempt to extract detailed error message from FastAPI response body
+        detail = "No additional detail from API."
+        if e.response and e.response.content:
+            try:
+                response_json = e.response.json()
+                detail = response_json.get("detail", detail)
+            except json.JSONDecodeError:
+                # If not JSON, just show the text response
+                detail = f"API returned non-JSON error: {e.response.text[:200]}..."
+            except Exception as parse_e:
+                 detail = f"Failed to parse API error details: {parse_e}"
+
+
+        st.error(f"API Request Failed: {error_message}", icon="🚨")
+        if detail and detail != "No additional detail from API.": # Only show detail if we got something specific
+             st.error(f"Details: {detail}")
+
+        return {"error": error_message, "detail": detail}
+    except Exception as e:
+        unexpected_error_msg = f"An unexpected error occurred during API call: {e}"
+        logger.error(unexpected_error_msg, exc_info=True) # Log the full exception
+        st.error(unexpected_error_msg, icon="🚨")
+        return {"error": unexpected_error_msg}
+
+
+def get_projects():
+    """Fetches the list of projects from the API."""
+    response_data = call_api("GET", "/projects")
+    if "error" not in response_data:
+        return response_data.get("projects", [])
+    return [] # Return empty list on error or if 'projects' key is missing
+
+
+def load_project_api(project_name: str):
+    """Loads a project state from the API."""
+    response_data = call_api("GET", f"/projects/{project_name}")
+    if "error" not in response_data:
+        st.session_state.project_state = response_data # Store the full state from API
+        st.session_state.active_char_for_display = None # Reset selected char on load
+        # Also clear temporary AI outputs from Pro mode
+        st.session_state.temp_drafted_scene = ""
+        st.session_state.temp_refined_text = ""
+        st.session_state.temp_profile_suggestions = ""
+        # Ensure pre_production images are loaded (they are part of state)
+        st.session_state.project_state['pre_production'] = st.session_state.project_state.get('pre_production', {}) # Ensure dict exists
+        st.session_state.project_state['pre_production']['moodboard_images'] = st.session_state.project_state['pre_production'].get('moodboard_images', [])
+        st.session_state.project_state['pre_production']['storyboard_images'] = st.session_state.project_state['pre_production'].get('storyboard_images', [])
+
+        st.success(f"Project '{project_name}' loaded from API.")
+        st.rerun() # Rerun to update UI based on loaded state
+    # Error message is displayed by call_api
+
+
+def create_project_api(new_project_name: str):
+    """Creates a new project via the API."""
+    response_data = call_api("POST", "/projects", json_data={"project_name": new_project_name})
+    if "error" not in response_data:
+        st.session_state.project_state = response_data # API returns the initial state
+        st.session_state.active_char_for_display = None # Reset selected char on create
+         # Also clear temporary AI outputs from Pro mode
+        st.session_state.temp_drafted_scene = ""
+        st.session_state.temp_refined_text = ""
+        st.session_state.temp_profile_suggestions = ""
+        # Initialize pre_production images lists
+        st.session_state.project_state['pre_production'] = st.session_state.project_state.get('pre_production', {}) # Ensure dict exists
+        st.session_state.project_state['pre_production']['moodboard_images'] = []
+        st.session_state.project_state['pre_production']['storyboard_images'] = []
+
+
+        st.success(f"New project '{new_project_name}' created via API.")
+        st.session_state.ti_new_project_name_ui = "" # Clear the input field by updating its key in state
+        st.rerun() # Rerun to update project list and UI
+    # Error message is displayed by call_api
+
+
+def save_project_api():
+    """Saves the current project state via the API."""
+    if 'project_state' not in st.session_state or st.session_state.project_state.get("project_name") in ["Untitled", None]:
+        st.warning("Cannot save an unnamed project. Load or create a project first.")
         return
 
-    project_name_display = state["project_name"]
-    state_file = _get_project_state_path(project_name_display)
-    if not state_file:
-         st.error(f"Error: Invalid project name '{project_name_display}' for saving.")
-         return
+    project_name = st.session_state.project_state["project_name"]
+    # Send the *entire* current state from session_state to the API
+    # The API saves the state, including updating the log and last_saved timestamp.
+    state_to_save = st.session_state.project_state
+    response_data = call_api("PUT", f"/projects/{project_name}", json_data=state_to_save)
 
-    project_dir = os.path.dirname(state_file)
-
-    try:
-        os.makedirs(project_dir, exist_ok=True)
-        state["last_saved"] = datetime.now().isoformat()
-        state["log"] = state.get("log", [])[-50:]
-        state["log"].append(f"State saved at {state['last_saved']}")
-
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=4)
-        st.success(f"Project '{project_name_display}' saved successfully!")
-        print(f"Project '{project_name_display}' saved.")
-        # Update state in session_state (mainly for log/save time)
-        st.session_state.project_state = state
+    if "error" not in response_data:
+        # API returns the state with updated save time and log
+        st.session_state.project_state = response_data # Update local state with latest from API
+        st.success(f"Project '{project_name}' saved via API!")
         # No explicit rerun needed, success message display implies it happens
-    except Exception as e:
-        error_msg = f"Error saving project '{project_name_display}': {e}"
-        print(error_msg)
-        st.error(error_msg)
-        # Log failure but don't corrupt state if save fails
-        st.session_state.project_state["log"] = st.session_state.project_state.get("log", [])
-        st.session_state.project_state["log"].append(f"SAVE FAILED: {error_msg}")
-        st.session_state.project_state["log"] = st.session_state.project_state["log"][-50:]
 
-
-def load_project_state(project_name_display: str):
-    """Loads project state from file into st.session_state."""
-    if not project_name_display:
-        st.error("No project selected to load.")
-        return
-
-    state_file = _get_project_state_path(project_name_display)
-    if not state_file or not os.path.exists(state_file):
-        msg = f"Error: Project state file not found for '{project_name_display}'. Cannot load."
-        print(msg)
-        st.error(msg)
-        # Don't load default, keep existing state or let user create new
-        return
-
-    try:
-        with open(state_file, 'r') as f:
-            loaded_state = json.load(f)
-
-        # --- State Merging Logic ---
-        default_copy = copy.deepcopy(DEFAULT_PROJECT_STATE)
-        # Ensure loaded state has the correct project display name
-        loaded_state["project_name"] = project_name_display
-        loaded_state["cleaned_name"] = project_name_display.strip().replace(" ", "_").lower()
-        # Merge missing keys from default
-        for key, default_value in default_copy.items():
-            if key not in loaded_state:
-                loaded_state[key] = default_value
-            elif isinstance(default_value, dict):
-                 if not isinstance(loaded_state.get(key), dict): loaded_state[key] = {}
-                 for sub_key, default_sub_value in default_value.items():
-                     if sub_key not in loaded_state[key]: loaded_state[key][sub_key] = default_sub_value
-        # --- End State Merging ---
-
-        loaded_state["log"] = loaded_state.get("log", [])[-50:]
-        loaded_state["log"].append(f"Project '{project_name_display}' loaded.")
-        st.session_state.project_state = loaded_state # Update session state
-        st.success(f"Project '{project_name_display}' loaded successfully.")
-        print(f"Project '{project_name_display}' loaded.")
-        st.rerun() # Rerun to reflect loaded state in UI widgets
-    except Exception as e:
-        error_msg = f"Error loading project '{project_name_display}': {e}."
-        print(error_msg)
-        st.error(error_msg)
-
-def create_new_project(new_project_name_display: str):
-    """Creates and saves a new project, updating st.session_state."""
-    if not new_project_name_display:
-        st.error("New project name cannot be empty.")
-        return
-
-    project_name_orig = new_project_name_display.strip()
-    if not project_name_orig:
-        st.error("Project name cannot be empty.")
-        return
-
-    project_dir_check = os.path.join(config.PROJECTS_BASE_DIR, project_name_orig)
-    clean_name = project_name_orig.replace(" ", "_").lower()
-    state_file = os.path.join(project_dir_check, f"{clean_name}_state.json")
-
-    if os.path.isdir(project_dir_check) or os.path.exists(state_file):
-        st.error(f"Error: Project '{project_name_orig}' already exists. Try loading or choose different name.")
-        return
-
-    # Create new state
-    new_state = copy.deepcopy(DEFAULT_PROJECT_STATE)
-    new_state["project_name"] = project_name_orig # Store original display name
-    new_state["cleaned_name"] = clean_name
-    new_state["log"] = [f"Created new project '{project_name_orig}'."]
-    new_state["last_saved"] = None
-
-    # Initial save (uses name from state)
-    status, saved_state = save_project_state(new_state) # Pass the state dict
-
-    if "Error" in status:
-         # If save failed, display error but keep the unsaved state in session for potential retry?
-         st.session_state.project_state = new_state # Reflect the attempted new state
-         st.error(status)
-    else:
-        # If save succeeded, update session state with the *saved* state (has save time, log)
-        st.session_state.project_state = saved_state
-        st.success(f"New project '{project_name_orig}' created and saved.")
-        st.rerun() # Rerun to reflect the new project state
-
-def update_log(message):
-    """Appends a message to the project log in session_state."""
-    if 'project_state' in st.session_state and isinstance(st.session_state.project_state, dict):
-        log_list = st.session_state.project_state.get("log", [])
-        log_list.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-        st.session_state.project_state["log"] = log_list[-50:]
-    else:
-        print("Warning: update_log called before project_state initialized.")
-
-
-# --- Instantiate Agents ---
-concept_agent = ConceptAgent()
-character_agent = CharacterCrafterAgent()
-script_agent = ScriptSmithAgent()
-
-
-# ==============================================================================
-# Streamlit App Layout and Logic
-# ==============================================================================
-
-st.set_page_config(layout="wide", page_title="FilmForge AI Assistant")
-st.title("🎬 FilmForge AI Assistant")
 
 # --- Initialize Session State ---
+# This state is CLIENT-SIDE state, reflecting what's loaded from the API
 if 'project_state' not in st.session_state:
-    st.session_state.project_state = copy.deepcopy(DEFAULT_PROJECT_STATE)
-    print("Initialized Session State")
+    logger.info("Initializing Streamlit Session State: project_state")
+    # Start with a default placeholder state reflecting nothing is loaded
+    st.session_state.project_state = {
+        "project_name": "Untitled",
+        "cleaned_name": "untitled",
+        "current_phase": "Concept", # Can track which tab the user was on, though not strictly necessary for state
+        "concept": {}, # Placeholder, API load will fill this
+        "characters": {},
+        "script": {},
+        "pre_production": { "moodboard_images": [], "storyboard_images": [] }, # Initialize image lists
+        "last_saved": None,
+        "log": ["UI initialized. Connect to backend API."]
+    }
+
 if 'active_char_for_display' not in st.session_state:
-     st.session_state.active_char_for_display = None # Track selected char for display
+    logger.info("Initializing Streamlit Session State: active_char_for_display")
+    st.session_state.active_char_for_display = None # Track selected char for display in UI
+
+# Temporary storage for AI outputs that aren't part of persistent project state (Pro mode)
+if 'temp_drafted_scene' not in st.session_state:
+    logger.info("Initializing Streamlit Session State: temp_drafted_scene")
+    st.session_state.temp_drafted_scene = ""
+
+if 'temp_refined_text' not in st.session_state:
+    logger.info("Initializing Streamlit Session State: temp_refined_text")
+    st.session_state.temp_refined_text = ""
+
+if 'temp_profile_suggestions' not in st.session_state:
+    logger.info("Initializing Streamlit Session State: temp_profile_suggestions")
+    st.session_state.temp_profile_suggestions = ""
+
+# Flag to signal clearing the storyboard input text area on the next rerun
+if 'clear_sb_input_flag' not in st.session_state:
+     logger.info("Initializing Streamlit Session State: clear_sb_input_flag")
+     st.session_state.clear_sb_input_flag = False
+
+# --- New Session State for Kids Mode ---
+if 'mode' not in st.session_state:
+    logger.info("Initializing Streamlit Session State: mode")
+    st.session_state.mode = "Pro" # Default mode
+
+if 'kids_prompt_ui' not in st.session_state:
+     logger.info("Initializing Streamlit Session State: kids_prompt_ui")
+     st.session_state.kids_prompt_ui = ""
+
+if 'kids_image_parts' not in st.session_state:
+    logger.info("Initializing Streamlit Session State: kids_image_parts")
+    st.session_state.kids_image_parts = [] # Stores the list of image/text parts from the API response
 
 
-# --- Helper to get current project state ---
+# --- Helper to get current project state (from session state) ---
 def get_state():
-     # Ensures we always work with the session state's project data
-     if 'project_state' not in st.session_state:
-          st.session_state.project_state = copy.deepcopy(DEFAULT_PROJECT_STATE)
+     # Always work with the client's view of the project state from session_state
      return st.session_state.project_state
 
-# --- Sidebar for Project Management ---
+# --- UI Layout ---
+
+st.set_page_config(layout="wide", page_title="FilmForge AI")
+st.title("🎬 FilmForge AI Engine")
+st.caption(f"Connected to backend at: {API_BASE_URL}")
+
+
+# --- Sidebar ---
 with st.sidebar:
-    st.header("Project Management")
-
-    # Load Project
-    projects = get_project_list()
-    # Ensure current project name is valid for selectbox default
-    current_project_name = get_state().get("project_name", "Untitled")
-    try:
-        # Set index=None if current project isn't in the list or is "Untitled"
-        current_project_index = projects.index(current_project_name) if current_project_name != "Untitled" and current_project_name in projects else None
-    except ValueError:
-         current_project_index = None # Handle case where project name exists but not in list (e.g. after deletion)
-
-
-    selected_project = st.selectbox(
-        "Load Existing Project",
-        options=projects,
-        index=current_project_index,
-        placeholder="Select project...",
-        key="sb_load_project" # Use key to track selection
+    st.header("Mode Selection")
+    selected_mode = st.radio(
+        "Choose Mode",
+        options=["Pro Mode", "Kids Mode"],
+        index=0 if st.session_state.mode == "Pro" else 1,
+        key="mode_select_ui" # Unique key
     )
-
-    if st.button("Load Project", key="btn_load", disabled=(selected_project is None)):
-        if selected_project:
-            update_log(f"Attempting to load project: {selected_project}")
-            load_project_state(selected_project)
-            st.session_state.active_char_for_display = None # Reset active char on load
+    # Update session state if the mode changes via radio button
+    if selected_mode == "Pro Mode" and st.session_state.mode != "Pro":
+        st.session_state.mode = "Pro"
+        st.rerun() # Rerun to switch mode
+    elif selected_mode == "Kids Mode" and st.session_state.mode != "Kids":
+        st.session_state.mode = "Kids"
+        st.rerun() # Rerun to switch mode
 
     st.divider()
 
-    # Create New Project
-    new_proj_name = st.text_input("New Project Name", key="ti_new_project_name")
-    if st.button("Create New Project", key="btn_create"):
-        if new_proj_name:
-            update_log(f"Attempting to create project: {new_proj_name}")
-            create_new_project(new_proj_name)
-            # Clear input after attempt (handled by rerun if successful)
-            st.session_state.ti_new_project_name = "" # Explicitly clear input state if needed
-            st.session_state.active_char_for_display = None # Reset active char on create
+    # Project Management section is only shown in Pro Mode
+    if st.session_state.mode == "Pro":
+        st.header("Project Management")
+
+        # Load Project
+        projects = get_projects() # Fetch list from API
+        current_project_name = get_state().get("project_name", "Untitled")
+
+        # Determine current index for selectbox default
+        try:
+            current_project_index = projects.index(current_project_name) if current_project_name != "Untitled" and current_project_name in projects else None
+        except ValueError:
+             current_project_index = None # Handle case where current project might not be in the list
+
+
+        selected_project = st.selectbox(
+            "Load Existing Project",
+            options=projects,
+            index=current_project_index,
+            placeholder="Select project...",
+            key="sb_load_project_ui" # Use a unique key for the widget
+        )
+
+        if st.button("Load Project", key="btn_load_ui", disabled=(selected_project is None)):
+            if selected_project:
+                load_project_api(selected_project)
+
+
+        st.divider()
+
+        # Create New Project
+        new_proj_name = st.text_input("New Project Name", key="ti_new_project_name_ui") # Use a unique key
+        if st.button("Create New Project", key="btn_create_ui"): # Use a unique key
+            if new_proj_name:
+                create_project_api(new_proj_name)
+            else:
+                st.warning("Please enter a name for the new project.")
+
+        st.divider()
+
+        # Save Project
+        # Button is only enabled if a project is loaded (not "Untitled")
+        if st.button("Save Current Project", key="btn_save_ui", disabled=(get_state().get("project_name") == "Untitled")): # Use a unique key
+            save_project_api()
+
+        st.divider()
+        st.write(f"**Current Project:** {get_state().get('project_name', 'Untitled')}")
+        last_saved = get_state().get('last_saved')
+        if last_saved:
+            try:
+                # Parse ISO format string
+                saved_dt = datetime.fromisoformat(last_saved)
+                st.caption(f"Last Saved: {saved_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            except (ValueError, TypeError): # Handle potential errors if last_saved format is unexpected
+                st.caption(f"Last Saved: {last_saved}") # Display raw string if parsing fails
         else:
-            st.warning("Please enter a name for the new project.")
+             st.caption("Not saved yet.")
 
-    st.divider()
 
-    # Save Project
-    if st.button("Save Current Project", key="btn_save"):
-        save_project_state()
+# --- Main Content Area ---
 
-    st.divider()
-    st.write(f"**Current Project:** {get_state().get('project_name', 'Untitled')}")
-    last_saved = get_state().get('last_saved')
-    if last_saved:
-        st.caption(f"Last Saved: {datetime.fromisoformat(last_saved).strftime('%Y-%m-%d %H:%M:%S')}")
+# Conditional rendering based on mode
+if st.session_state.mode == "Kids":
+    # --- Kids Mode UI ---
+    st.header("🎨 FilmForge Kids' Comic Creator!")
+    st.markdown("Type what you want to see in a comic picture!")
+
+    # Use key to bind input to session state
+    kids_prompt = st.text_input("Tell me what to draw (e.g., 'A superhero flying over a city', 'A friendly monster eating a cookie')", key="kids_prompt_ui")
+
+    # Button to trigger image generation
+    if st.button("Generate Comic Image!", key="btn_kids_generate_ui"): # Unique key
+        prompt_val = st.session_state.kids_prompt_ui # Read value via key
+
+        if prompt_val.strip():
+            st.info(f"Generating comic image for: '{prompt_val}'...")
+            # Call the NEW API endpoint for comic image generation
+            response_data = call_api("POST", "/generate/comic-image", json_data={"prompt": prompt_val})
+
+            if "error" not in response_data:
+                # API returns a list of parts (image/text)
+                st.session_state.kids_image_parts = response_data.get("parts", [])
+                st.success("Comic image generated!")
+                st.rerun() # Rerun to display the images
+            # Error is handled and displayed by call_api
+        else:
+            st.warning("Please enter a prompt to generate a comic image.")
+
+    st.markdown("---")
+
+    # Display generated images and text parts
+    if st.session_state.kids_image_parts:
+        st.subheader("Generated Comic:")
+        for i, part in enumerate(st.session_state.kids_image_parts):
+             if part.get("type", "").startswith("image/"):
+                 try:
+                     img_bytes = base64.b64decode(part.get("content"))
+                     img = Image.open(io.BytesIO(img_bytes))
+                     # Optional: Resize images for consistency if needed
+                     # img.thumbnail((800, 800))
+                     st.image(img, caption=f"Part {i+1}", use_column_width=True)
+                 except Exception as e:
+                     st.warning(f"Failed to display image part {i+1}: {e}")
+             elif part.get("type") == "text":
+                 st.write(f"**Text Part {i+1}:**")
+                 st.markdown(part.get("content")) # Use markdown for potential formatting
+             elif part.get("type") == "error":
+                 st.error(f"Image generation part {i+1} failed: {part.get('content')}")
+             else:
+                 st.warning(f"Skipping unknown part type: {part.get('type')}")
+
+
+else: # st.session_state.mode == "Pro"
+    # --- Pro Mode UI (Existing Tabs) ---
+    tab_titles = [
+        "1. Concept Development",
+        "2. Character Development",
+        "3. Screenwriting",
+        "4. Pre-Production Ideas",
+        "Log"
+    ]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(tab_titles) # Unique keys implicitly generated by order/labels
+
+    # Ensure we have a loaded project before displaying most tabs' content in Pro mode
+    if get_state().get("project_name") == "Untitled":
+        st.info("Please load or create a project using the sidebar to begin.")
     else:
-         st.caption("Not saved yet.")
+        # --- Tab 1: Concept Development ---
+        with tab1:
+            st.header("Concept Development")
+            st.markdown("Define the core idea of your film.")
 
+            current_concept_state = get_state().get("concept", {}) # Get the concept state from loaded project
 
-# --- Main Content Area with Tabs ---
-tab_titles = [
-    "1. Concept Development",
-    "2. Character Development",
-    "3. Screenwriting",
-    "4. Pre-Production Ideas",
-    "Log"
-]
-tab1, tab2, tab3, tab4, tab5 = st.tabs(tab_titles)
+            seed_idea = st.text_area(
+                "Seed Idea (Genre, Theme, Logline, Keywords)",
+                value=current_concept_state.get("seed_idea", ""),
+                key="concept_seed_idea_ta_ui" # Unique key for UI element
+            )
 
-# --- Tab 1: Concept Development ---
-with tab1:
-    st.header("Concept Development")
-    st.markdown("Define the core idea of your film.")
+            if st.button("Generate Initial Concepts", key="btn_gen_concepts_ui"): # Unique key
+                seed_idea_val = st.session_state.concept_seed_idea_ta_ui
 
-    # Use session state to preserve input across runs
-    seed_idea = st.text_area(
-        "Seed Idea (Genre, Theme, Logline, Keywords)",
-        value=get_state().get("concept", {}).get("seed_idea", ""), # Pre-fill from state
-        key="concept_seed_idea_ta" # Unique key
-    )
-    # Update state immediately if text area changes (Streamlit reruns on change)
-    get_state()["concept"]["seed_idea"] = seed_idea
-
-    if st.button("Generate Initial Concepts", key="btn_gen_concepts"):
-        if seed_idea:
-            update_log("Generating initial concepts...")
-            with st.spinner("AI is thinking..."):
-                result = concept_agent.generate_initial_concepts(seed_idea)
-            if "Error:" in result:
-                st.error(result)
-                update_log(f"Concept generation failed: {result}")
-            else:
-                get_state()["concept"]["generated_concepts_md"] = result
-                update_log("Concept generation complete.")
-                # Result will be displayed below because state is updated
-        else:
-            st.warning("Please enter a seed idea.")
-
-    # Display generated concepts (always reads from state)
-    st.markdown("---")
-    st.markdown("**Generated Concepts:**")
-    st.markdown(get_state().get("concept", {}).get("generated_concepts_md", "*No concepts generated yet.*"))
-    st.markdown("---")
-
-    st.subheader("Refine Your Concept")
-    # Use columns for better layout
-    col1, col2 = st.columns(2)
-    with col1:
-        logline = st.text_input(
-            "Chosen Logline",
-            value=get_state().get("concept", {}).get("chosen_logline", ""),
-            key="concept_logline"
-        )
-        get_state()["concept"]["chosen_logline"] = logline # Update state on change
-
-        theme = st.text_input(
-            "Chosen Theme",
-            value=get_state().get("concept", {}).get("chosen_theme", ""),
-            key="concept_theme"
-        )
-        get_state()["concept"]["chosen_theme"] = theme
-    with col2:
-        framework = st.text_input(
-            "Chosen Narrative Framework",
-             value=get_state().get("concept", {}).get("chosen_framework", "Three-Act Structure"),
-             key="concept_framework"
-        )
-        get_state()["concept"]["chosen_framework"] = framework
-
-        conflict = st.text_input(
-            "Chosen Central Conflict",
-            value=get_state().get("concept", {}).get("chosen_conflict", ""),
-            key="concept_conflict"
-        )
-        get_state()["concept"]["chosen_conflict"] = conflict
-
-    if st.button("Generate Synopsis & Twists", key="btn_gen_synopsis"):
-        concept_details = {
-            'logline': logline, 'framework': framework, 'theme': theme, 'conflict': conflict
-        }
-        if logline or theme: # Need at least one element
-            update_log("Generating synopsis...")
-            with st.spinner("AI is thinking..."):
-                result = concept_agent.generate_synopsis(concept_details)
-            if "Error:" in result:
-                st.error(result)
-                update_log(f"Synopsis generation failed: {result}")
-            else:
-                get_state()["concept"]["synopsis_md"] = result
-                update_log("Synopsis generation complete.")
-        else:
-            st.warning("Please provide at least a Logline or Theme.")
-
-    st.markdown("**Generated Synopsis & Twists:**")
-    st.markdown(get_state().get("concept", {}).get("synopsis_md", "*No synopsis generated yet.*"))
-
-
-# --- Tab 2: Character Development ---
-with tab2:
-    st.header("Character Development")
-    st.markdown("Develop your characters.")
-
-    state_chars = get_state().get("characters", {})
-    char_names = list(state_chars.keys())
-
-    col1, col2 = st.columns([1, 2]) # Adjust column ratios as needed
-
-    with col1:
-        st.subheader("Add/Edit Character")
-        char_name = st.text_input("Character Name", key="char_name_input")
-        char_role = st.text_input("Character Role", placeholder="e.g., Protagonist", key="char_role_input")
-
-        if st.button("Suggest Profile Elements", key="btn_suggest_profile"):
-            if char_name and char_role:
-                update_log(f"Generating profile ideas for {char_name}...")
-                genre = get_state().get("concept", {}).get("seed_idea", "Unknown Genre")
-                theme = get_state().get("concept", {}).get("chosen_theme", "General Theme")
-                with st.spinner("AI is suggesting..."):
-                     result = character_agent.suggest_profile_elements(char_role, genre, theme)
-                # Display suggestions temporarily, don't save to state unless user copies
-                st.session_state.temp_profile_suggestions = result # Store in session state for display this run
-                update_log("Profile suggestions generated.")
-            else:
-                st.warning("Please enter Character Name and Role.")
-
-        # Display temporary suggestions if they exist
-        if 'temp_profile_suggestions' in st.session_state and st.session_state.temp_profile_suggestions:
-             with st.expander("Show/Hide Profile Suggestions", expanded=True):
-                  st.markdown(st.session_state.temp_profile_suggestions)
-                  # Clear after display? Or keep until next suggestion? Let's keep for now.
-                  # del st.session_state.temp_profile_suggestions
-
-        st.markdown("**Define Character Profile:**")
-        # Use current char name for default values if editing
-        current_profile = state_chars.get(char_name, {}).get("profile", {}) if char_name else {}
-        backstory = st.text_area("Chosen Backstory", value=current_profile.get("backstory", ""), key="char_backstory")
-        motivation = st.text_area("Chosen Motivation", value=current_profile.get("motivation", ""), key="char_motivation")
-        flaw = st.text_area("Chosen Flaw", value=current_profile.get("flaw", ""), key="char_flaw")
-
-        if st.button("Save/Update Character Profile", key="btn_save_char"):
-             if char_name and char_role:
-                  update_log(f"Saving/Updating character: {char_name}")
-                  if "characters" not in get_state(): get_state()["characters"] = {} # Ensure dict exists
-                  # Preserve existing arc/rels if updating
-                  existing_data = get_state()["characters"].get(char_name, {})
-                  get_state()["characters"][char_name] = {
-                      "role": char_role,
-                      "profile": { "backstory": backstory, "motivation": motivation, "flaw": flaw },
-                      "arc_description": existing_data.get("arc_description", ""),
-                      "relationship_suggestions": existing_data.get("relationship_suggestions", "")
-                  }
-                  st.success(f"Character '{char_name}' profile saved.")
-                  update_log(f"Character {char_name} saved.")
-                  # Clear inputs? Or keep for further editing? Let's keep for now.
-                  # Reset temporary suggestion display
-                  if 'temp_profile_suggestions' in st.session_state: del st.session_state.temp_profile_suggestions
-                  st.rerun() # Rerun to update character list dropdown
-             else:
-                  st.warning("Please enter Character Name and Role.")
-
-    with col2:
-        st.subheader("Explore Arcs & Relationships")
-        char_options = ["Select a character..."] + char_names
-        # Use the session state variable to control the selection
-        selected_char_for_arc = st.selectbox(
-             "Select Character",
-             options=char_options,
-             index=char_options.index(st.session_state.active_char_for_display) if st.session_state.active_char_for_display in char_options else 0,
-             key="char_select_arc"
-        )
-
-        # Update the active character display variable when selection changes
-        if selected_char_for_arc != "Select a character..." and selected_char_for_arc != st.session_state.active_char_for_display:
-             st.session_state.active_char_for_display = selected_char_for_arc
-             # Rerun might be needed if display depends heavily on this, but let's try without first
-             # st.rerun()
-
-        active_char_data = state_chars.get(st.session_state.active_char_for_display, {}) if st.session_state.active_char_for_display else {}
-
-        # Display Arc
-        st.markdown("**Character Arc:**")
-        if st.button("Generate Character Arc", key="btn_gen_arc", disabled=(not st.session_state.active_char_for_display)):
-            char_name_active = st.session_state.active_char_for_display
-            if char_name_active and char_name_active in get_state()["characters"]:
-                 update_log(f"Generating arc for {char_name_active}...")
-                 profile = get_state()["characters"][char_name_active].get("profile", {})
-                 framework = get_state()["concept"].get("chosen_framework", "Three-Act Structure")
-                 with st.spinner("AI is mapping the arc..."):
-                      result = character_agent.map_character_arc(profile, framework)
-                 if "Error:" in result:
-                      st.error(result)
-                      update_log(f"Arc generation FAILED for {char_name_active}: {result}")
-                 else:
-                      get_state()["characters"][char_name_active]["arc_description"] = result
-                      update_log(f"Arc generation complete for {char_name_active}.")
-                      st.success(f"Generated arc for {char_name_active}.")
-                      # Rerun likely needed to update the display below immediately
-                      st.rerun()
-
-        # Always display arc description from state for the active character
-        arc_desc = active_char_data.get("arc_description", "*No arc generated yet.*")
-        st.markdown(arc_desc)
-        st.markdown("---")
-
-        # Display Relationships
-        st.markdown("**Relationship Suggestions:**")
-        if st.button("Suggest Relationships", key="btn_gen_rels", disabled=(not st.session_state.active_char_for_display)):
-            char_name_active = st.session_state.active_char_for_display
-            if char_name_active and char_name_active in get_state()["characters"]:
-                 update_log(f"Generating relationships for {char_name_active}...")
-                 profile = get_state()["characters"][char_name_active].get("profile", {})
-                 other_roles = [data["role"] for name, data in get_state()["characters"].items() if name != char_name_active and isinstance(data, dict)]
-                 with st.spinner("AI is exploring connections..."):
-                      result = character_agent.suggest_relationships(profile, other_roles)
-
-                 if "Error:" in result:
-                      st.error(result)
-                      update_log(f"Relationship suggestions FAILED for {char_name_active}: {result}")
-                 else:
-                      get_state()["characters"][char_name_active]["relationship_suggestions"] = result
-                      update_log(f"Relationship suggestions complete for {char_name_active}.")
-                      st.success(f"Generated relationship suggestions for {char_name_active}.")
-                      st.rerun() # Rerun likely needed
-
-        # Always display relationship suggestions from state for the active character
-        rel_sugg = active_char_data.get("relationship_suggestions", "*No relationship suggestions generated yet.*")
-        st.markdown(rel_sugg)
-
-
-# --- Tab 3: Screenwriting ---
-with tab3:
-    st.header("Screenwriting")
-    st.markdown("Write your screenplay.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Generate Outline from Synopsis", key="btn_gen_outline"):
-            update_log("Generating script outline...")
-            synopsis = get_state()["concept"].get("synopsis_md", "")
-            if synopsis and "### Potential Twists" in synopsis: synopsis = synopsis.split("### Potential Twists")[0].strip()
-            if not synopsis: synopsis = get_state()["concept"].get("chosen_logline", "")
-            if synopsis:
-                framework = get_state()["concept"].get("chosen_framework", "Three-Act Structure")
-                with st.spinner("AI is outlining..."):
-                     result = script_agent.generate_outline(synopsis, framework)
-                if "Error:" in result:
-                     st.error(result); update_log(f"Outline generation FAILED: {result}")
+                if seed_idea_val:
+                    st.info("Generating initial concepts via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/concept/generate-concepts", json_data={"seed_idea": seed_idea_val})
+                    if "error" not in response_data:
+                        if "concept" in st.session_state.project_state:
+                            st.session_state.project_state["concept"]["generated_concepts_md"] = response_data.get("text", "")
+                            st.success("Concepts generated and saved.")
+                            st.rerun()
+                        else:
+                            st.error("API returned success but concept state not found locally.")
                 else:
-                     get_state()["script"]["outline_md"] = result
-                     update_log("Outline generation complete.")
-                     st.success("Outline generated.")
-                     # No rerun needed, display below will update
-            else:
-                st.warning("Cannot generate outline without a synopsis or logline.")
+                    st.warning("Please enter a seed idea.")
 
-        st.markdown("**Generated Outline:**")
-        st.markdown(get_state().get("script", {}).get("outline_md", "*No outline generated yet.*"))
+            st.markdown("---")
+            st.markdown("**Generated Concepts:**")
+            st.markdown(get_state().get("concept", {}).get("generated_concepts_md", "*No concepts generated yet.*"))
+            st.markdown("---")
 
-    with col2:
-        st.subheader("Draft Scene")
-        scene_heading = st.text_input("Scene Heading", placeholder="INT. LOCATION - DAY/NIGHT", key="scene_head")
-        scene_desc = st.text_area("Scene Description/Goal", key="scene_desc")
-        scene_context = st.text_input("Character Context (Optional)", key="scene_context")
-        scene_tone = st.text_input("Scene Tone (Optional)", key="scene_tone")
-
-        # Temporarily store drafted scene result in session state for display
-        if 'temp_drafted_scene' not in st.session_state: st.session_state.temp_drafted_scene = ""
-
-        if st.button("Draft Scene", key="btn_draft_scene"):
-             if scene_heading and scene_desc:
-                  update_log(f"Drafting scene: {scene_heading}")
-                  with st.spinner("AI is writing..."):
-                       result = script_agent.draft_scene(scene_heading, scene_desc, scene_context, scene_tone)
-                  st.session_state.temp_drafted_scene = result # Store for display
-                  if "Error:" in result:
-                       st.error(result); update_log(f"Scene drafting FAILED: {result}")
-                  else:
-                       update_log("Scene drafting complete.")
-                       st.info("Drafted scene below. Copy and paste into the main script editor.")
-             else:
-                  st.warning("Scene Heading and Description are required.")
-
-        st.text_area("Drafted Scene Output", value=st.session_state.temp_drafted_scene, height=200, key="drafted_scene_disp", help="Copy from here")
-
-    st.markdown("---")
-    st.subheader("Full Script Draft")
-    full_script = st.text_area(
-        "Script Content (.fountain format recommended)",
-        value=get_state().get("script", {}).get("full_script_content", ""),
-        height=600,
-        key="script_editor_main"
-    )
-    # Update state immediately on change
-    get_state()["script"]["full_script_content"] = full_script
-
-    col_refine, col_analyze = st.columns(2)
-    with col_refine:
-        st.markdown("**Refine Text:**")
-        text_to_refine = st.text_area("Paste Dialogue or Action Line to Refine", height=100, key="refine_input_text")
-        refine_instruction = st.text_input("Refinement Instruction", placeholder="e.g., 'Make dialogue tense'", key="refine_instr")
-        if 'temp_refined_text' not in st.session_state: st.session_state.temp_refined_text = ""
-
-        if st.button("Refine Text", key="btn_refine"):
-             if text_to_refine and refine_instruction:
-                 update_log("Refining text...")
-                 # Basic dialogue check (can be improved)
-                 is_dialogue = any(f"\n{cue.upper()}\n" in f"\n{text_to_refine}\n" for cue in get_state().get("characters", {}).keys())
-                 with st.spinner("AI is editing..."):
-                    if is_dialogue: result = script_agent.refine_dialogue_tone(text_to_refine, refine_instruction)
-                    elif "concise" in refine_instruction.lower(): result = script_agent.refine_action_conciseness(text_to_refine)
-                    else: # Generic fallback
-                        generic_prompt = f"Instruction: '{refine_instruction}'. Apply to:\n---\n{text_to_refine}\n---"
-                        result = call_groq(generic_prompt, script_agent.sp_editor)
-                 st.session_state.temp_refined_text = result # Store for display
-                 if "Error:" in result: st.error(result); update_log(f"Refinement FAILED: {result}")
-                 else: update_log("Refinement complete."); st.info("Refined text below.")
-             else: st.warning("Text and instruction required.")
-        st.text_area("Refined Text Output", value=st.session_state.temp_refined_text, height=100, key="refined_text_disp", help="Copy from here")
-
-    with col_analyze:
-        st.markdown("**Analyze Script Issues:**")
-        if st.button("Analyze Script Issues (Last ~2000 Chars)", key="btn_analyze"):
-            script_content = get_state().get("script", {}).get("full_script_content", "")
-            if len(script_content) > 50:
-                update_log("Analyzing script...")
-                excerpt = script_content[-2000:]
-                with st.spinner("AI is analyzing..."):
-                     result = script_agent.analyze_script_issues(excerpt)
-                if "Error:" in result: st.error(result); update_log(f"Analysis FAILED: {result}")
-                else:
-                     get_state()["script"]["analysis_md"] = result
-                     update_log("Analysis complete.")
-                     st.success("Analysis complete.")
-                     # Rerun needed to show result below
-                     st.rerun()
-            else: st.warning("Not enough script content to analyze meaningfully.")
-        st.markdown(get_state().get("script", {}).get("analysis_md", "*No analysis performed yet.*"))
-
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-
-
-def generate_image_from_prod(prompt):
-    response = client.models.generate_content(
-            model="gemini-2.0-flash-exp-image-generation",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_modalities=['IMAGE','TEXT'])
-        )
-    for part in response.candidates[0].content.parts:
-        if part.text is not None:
-            st.write(part.text)
-        elif part.inline_data is not None:
-            image = Image.open(BytesIO(part.inline_data.data))
-            st.image(image, use_column_width=True)
-            
-# --- Tab 4: Pre-Production Ideas ---
-with tab4:
-    st.header("Pre-Production Ideas")
-    st.markdown("Generate visual ideas based on your script and concept.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Moodboard Ideas")
-        if st.button("Generate Moodboard Ideas", key="btn_gen_mood"):
-            update_log("Generating moodboard ideas...")
-            state = get_state()
-            theme = state["concept"].get("chosen_theme", "")
-            genre = state["concept"].get("seed_idea", "")
-            synopsis = state["concept"].get("final_synopsis", state["concept"].get("chosen_logline",""))
-        if theme or genre or synopsis:
-            with st.spinner("AI is brainstorming visuals..."):
-                text_result = script_agent.generate_moodboard_ideas(theme, genre, synopsis)
-            
-            if "Error:" in text_result:
-                st.error(text_result)
-                update_log(f"Moodboard generation FAILED: {text_result}")
-            else:
-                idea_list = text_result.split("\n")  # Assuming ideas are separated by new lines
-                idea_list = [idea.strip() for idea in idea_list if idea.strip()]
-
-                images = []
-                with st.spinner("AI is drawing moodboard images..."):
-                    for idea in idea_list:
-                        img = generate_image_from_prod(idea)
-                        images.append((idea, img))
-
-                state["pre_production"]["moodboard_ideas_md"] = text_result
-                state["pre_production"]["moodboard_images"] = images
-                update_log("Moodboard ideas and images generated.")
-                st.success("Moodboard ideas generated.")
-                st.rerun()
-        else:
-            st.warning("Provide Theme, Genre (Seed Idea), or Synopsis.")
-
-    # After markdown, display images with their text
-    moodboard_data = get_state().get("pre_production", {}).get("moodboard_images", [])
-    if moodboard_data:
-        col1, col2 = st.columns(2)
-        with col1:
-            for idx, (idea_text, img) in enumerate(moodboard_data[:len(moodboard_data)//2]):
-                if img:
-                    st.image(img, caption=idea_text, use_column_width=True)
-                else:
-                    st.warning(f"Could not generate image for: {idea_text}")
-        with col2:
-            for idx, (idea_text, img) in enumerate(moodboard_data[len(moodboard_data)//2:]):
-                if img:
-                    st.image(img, caption=idea_text, use_column_width=True)
-                else:
-                    st.warning(f"Could not generate image for: {idea_text}")
-
-    with col2:
-        st.subheader("Storyboard Shot Ideas")
-        scene_text_for_sb = st.text_area("Paste Scene Text Here", height=200, key="sb_scene_input")
-        if st.button("Generate Storyboard Ideas", key="btn_gen_sb"):
-            if scene_text_for_sb.strip():
-                update_log("Generating storyboard ideas...")
-                with st.spinner("AI is visualizing shots..."):
-                    text_result = script_agent.generate_storyboard_shot_ideas(scene_text_for_sb)
-
-                if "Error:" in text_result:
-                    st.error(text_result)
-                    update_log(f"Storyboard generation FAILED: {text_result}")
-                else:
-                    idea_list = text_result.split("\n")
-                    idea_list = [idea.strip() for idea in idea_list if idea.strip()]
-
-                    images = []
-                    with st.spinner("AI is drawing storyboard images..."):
-                        for idea in idea_list:
-                            img = generate_image_from_prod(idea)
-                            images.append((idea, img))
-
-                    get_state()["pre_production"]["storyboard_ideas_md"] = text_result
-                    get_state()["pre_production"]["storyboard_images"] = images
-                    update_log("Storyboard ideas and images generated.")
-                    st.success("Storyboard ideas generated.")
-                    st.session_state.sb_scene_input = ""
-                    st.rerun()
-            else:
-                st.warning("Please paste scene text.")
-
-        # After storyboard markdown, display images with their text
-        storyboard_data = get_state().get("pre_production", {}).get("storyboard_images", [])
-        if storyboard_data:
+            st.subheader("Refine Your Concept")
             col1, col2 = st.columns(2)
             with col1:
-                for idx, (idea_text, img) in enumerate(storyboard_data[:len(storyboard_data)//2]):
-                    if img:
-                        st.image(img, caption=idea_text, use_column_width=True)
-                    else:
-                        st.warning(f"Could not generate image for: {idea_text}")
+                logline = st.text_input(
+                    "Chosen Logline",
+                    value=current_concept_state.get("chosen_logline", ""),
+                    key="concept_logline_ui" # Unique key
+                )
+
+                theme = st.text_input(
+                    "Chosen Theme",
+                    value=current_concept_state.get("chosen_theme", ""),
+                    key="concept_theme_ui" # Unique key
+                )
             with col2:
-                for idx, (idea_text, img) in enumerate(storyboard_data[len(storyboard_data)//2:]):
-                    if img:
-                        st.image(img, caption=idea_text, use_column_width=True)
+                framework = st.text_input(
+                    "Chosen Narrative Framework",
+                     value=current_concept_state.get("chosen_framework", "Three-Act Structure"),
+                     key="concept_framework_ui" # Unique key
+                )
+
+                conflict = st.text_input(
+                    "Chosen Central Conflict",
+                    value=current_concept_state.get("chosen_conflict", ""),
+                    key="concept_conflict_ui" # Unique key
+                )
+
+            if st.button("Generate Synopsis & Twists", key="btn_gen_synopsis_ui"): # Unique key
+                logline_val = st.session_state.concept_logline_ui
+                theme_val = st.session_state.concept_theme_ui
+                framework_val = st.session_state.concept_framework_ui
+                conflict_val = st.session_state.concept_conflict_ui
+
+                concept_details_payload = {}
+                if logline_val: concept_details_payload['logline'] = logline_val
+                if framework_val: concept_details_payload['framework'] = framework_val
+                if theme_val: concept_details_payload['theme'] = theme_val
+                if conflict_val: concept_details_payload['conflict'] = conflict_val
+
+
+                if logline_val or theme_val or get_state().get("concept", {}).get("chosen_logline") or get_state().get("concept", {}).get("chosen_theme"):
+                    st.info("Generating synopsis via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/concept/generate-synopsis", json_data=concept_details_payload)
+
+                    if "error" not in response_data:
+                         if "concept" in st.session_state.project_state:
+                             if 'logline' in concept_details_payload: st.session_state.project_state["concept"]["chosen_logline"] = concept_details_payload['logline']
+                             if 'framework' in concept_details_payload: st.session_state.project_state["concept"]["chosen_framework"] = concept_details_payload['framework']
+                             if 'theme' in concept_details_payload: st.session_state.project_state["concept"]["chosen_theme"] = concept_details_payload['theme']
+                             if 'conflict' in concept_details_payload: st.session_state.project_state["concept"]["chosen_conflict"] = concept_details_payload['conflict']
+
+                             st.session_state.project_state["concept"]["synopsis_md"] = response_data.get("text", "")
+                             final_synopsis = response_data.get("text", "").split("### Potential Twists")[0].strip() if "### Potential Twists" in response_data.get("text", "") else response_data.get("text", "")
+                             st.session_state.project_state["concept"]["final_synopsis"] = final_synopsis
+
+                             st.success("Synopsis generated and saved.")
+                             st.rerun()
+                         else:
+                              st.error("API returned success but concept state not found locally.")
+
+                else:
+                    st.warning("Please provide at least a Logline or Theme.")
+
+            st.markdown("**Generated Synopsis & Twists:**")
+            st.markdown(get_state().get("concept", {}).get("synopsis_md", "*No synopsis generated yet.*"))
+
+
+        # --- Tab 2: Character Development ---
+        with tab2:
+            st.header("Character Development")
+            st.markdown("Develop your characters.")
+
+            state_chars = get_state().get("characters", {}) # Get the characters state from loaded project
+            char_names = list(state_chars.keys())
+
+            col1, col2 = st.columns([1, 2]) # Adjust column ratios as needed
+
+            with col1:
+                st.subheader("Add/Edit Character")
+                # Use keys to bind inputs to session state
+                char_name_input = st.text_input("Character Name", key="char_name_input_ui")
+                char_role_input = st.text_input("Character Role", placeholder="e.g., Protagonist", key="char_role_input_ui")
+
+                # Attempt to pre-fill profile fields if editing an existing character selected in col2
+                active_char_name = st.session_state.active_char_for_display
+                if active_char_name and active_char_name in state_chars:
+                     active_char_data = state_chars[active_char_name]
+                     # Set the session state values bound to the input field keys
+                     st.session_state.char_name_input_ui = active_char_name
+                     st.session_state.char_role_input_ui = active_char_data.get("role", "")
+                     active_profile = active_char_data.get("profile", {})
+                     st.session_state.char_backstory_ui = active_profile.get("backstory", "")
+                     st.session_state.char_motivation_ui = active_profile.get("motivation", "")
+                     st.session_state.char_flaw_ui = active_profile.get("flaw", "")
+                # Note: If the user changes char_name_input_ui, the link to active_char_for_display is broken
+                # for pre-filling, which is the desired behavior (they are now defining a *new* character).
+
+                if st.button("Suggest Profile Elements", key="btn_suggest_profile_ui"): # Unique key
+                    # Use values from the text inputs (synced by keys)
+                    name_val = st.session_state.char_name_input_ui
+                    role_val = st.session_state.char_role_input_ui
+
+                    if name_val and role_val:
+                        st.info(f"Generating profile ideas for {name_val} via API...")
+                        genre = get_state().get("concept", {}).get("seed_idea", "Unknown Genre")
+                        theme = get_state().get("concept", {}).get("chosen_theme", "General Theme")
+
+                        response_data = call_api("POST", f"/projects/{get_state()['project_name']}/characters/suggest-profile", json_data={"role": role_val, "genre": genre, "theme": theme})
+
+                        if "error" not in response_data:
+                            st.session_state.temp_profile_suggestions = response_data.get("text", "")
+                            st.success("Profile suggestions generated.")
                     else:
-                        st.warning(f"Could not generate image for: {idea_text}")
+                        st.warning("Please enter Character Name and Role.")
+
+                # Display temporary suggestions if they exist
+                if st.session_state.temp_profile_suggestions:
+                     with st.expander("Show/Hide Profile Suggestions", expanded=True):
+                          st.markdown(st.session_state.temp_profile_suggestions)
 
 
+                st.markdown("**Define Character Profile:**")
+                # Use keys to sync these text areas to session state
+                backstory = st.text_area("Chosen Backstory", key="char_backstory_ui")
+                motivation = st.text_area("Chosen Motivation", key="char_motivation_ui")
+                flaw = st.text_area("Chosen Flaw", key="char_flaw_ui")
 
-# --- Tab 5: Log ---
-with tab5:
-    st.header("Action Log")
-    log_content = "\n".join(get_state().get("log", ["Log is empty."]))
-    st.text_area("Log", value=log_content, height=600, disabled=True, key="log_display_area")
 
-# --- Final Check for API Key ---
-if not config.GROQ_API_KEY:
-     st.sidebar.error("GROQ API Key missing! AI features disabled.", icon="🚨")
+                if st.button("Save/Update Character Profile", key="btn_save_char_ui"): # Unique key
+                     # Read values from session state via keys
+                     name_val = st.session_state.char_name_input_ui
+                     role_val = st.session_state.char_role_input_ui
+                     backstory_val = st.session_state.char_backstory_ui
+                     motivation_val = st.session_state.char_motivation_ui
+                     flaw_val = st.session_state.char_flaw_ui
+
+                     if name_val and role_val:
+                          st.info(f"Saving/Updating character '{name_val}' profile via API...")
+                          profile_data = {
+                              "role": role_val,
+                              "profile": {
+                                  "backstory": backstory_val,
+                                  "motivation": motivation_val,
+                                  "flaw": flaw_val
+                              }
+                          }
+                          response_data = call_api("PUT", f"/projects/{get_state()['project_name']}/characters/{name_val}", json_data=profile_data)
+
+                          if "error" not in response_data:
+                               if "characters" not in st.session_state.project_state: st.session_state.project_state["characters"] = {}
+                               st.session_state.project_state["characters"][name_val] = response_data
+                               st.success(f"Character '{name_val}' profile saved via API.")
+                               st.session_state.temp_profile_suggestions = ""
+                               st.session_state.active_char_for_display = name_val
+                               st.rerun()
+                     else:
+                          st.warning("Please enter Character Name and Role.")
+
+            with col2:
+                st.subheader("Explore Arcs & Relationships")
+                current_char_names = list(get_state().get("characters", {}).keys())
+                char_options = ["Select a character..."] + current_char_names
+
+                try:
+                     current_char_index = char_options.index(st.session_state.active_char_for_display) if st.session_state.active_char_for_display in char_options else 0
+                except ValueError:
+                     current_char_index = 0
+
+
+                selected_char_for_arc = st.selectbox(
+                     "Select Character",
+                     options=char_options,
+                     index=current_char_index,
+                     key="char_select_arc_ui" # Unique key
+                )
+
+                if selected_char_for_arc != "Select a character..." and selected_char_for_arc != st.session_state.active_char_for_display:
+                     st.session_state.active_char_for_display = selected_char_for_arc
+                     st.rerun()
+
+                active_char_data_for_display = get_state().get("characters", {}).get(st.session_state.active_char_for_display, {})
+
+                st.markdown("**Character Arc:**")
+                can_generate_arc = (
+                    st.session_state.active_char_for_display
+                    and st.session_state.active_char_for_display in get_state().get("characters", {})
+                    and get_state()["characters"].get(st.session_state.active_char_for_display, {}).get("profile", {}).get("motivation")
+                    and get_state()["characters"].get(st.session_state.active_char_for_display, {}).get("profile", {}).get("flaw")
+                )
+                if st.button("Generate Character Arc", key="btn_gen_arc_ui", disabled=(not can_generate_arc)): # Unique key
+                    char_name_active = st.session_state.active_char_for_display
+                    st.info(f"Generating arc for {char_name_active} via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/characters/{char_name_active}/generate-arc")
+
+                    if "error" not in response_data:
+                        if "characters" in st.session_state.project_state and char_name_active in st.session_state.project_state["characters"]:
+                            st.session_state.project_state["characters"][char_name_active]["arc_description"] = response_data.get("text", "")
+                            st.success(f"Arc generated for {char_name_active}.")
+                            st.rerun()
+                        else:
+                            st.error(f"API returned success but character '{char_name_active}' state not found locally after update attempt.")
+
+
+                arc_desc = active_char_data_for_display.get("arc_description", "*No arc generated yet.*")
+                st.markdown(arc_desc)
+                st.markdown("---")
+
+                st.markdown("**Relationship Suggestions:**")
+                can_suggest_rels = (
+                     st.session_state.active_char_for_display
+                     and st.session_state.active_char_for_display in get_state().get("characters", {})
+                     and len(get_state().get("characters", {})) > 1
+                )
+                if st.button("Suggest Relationships", key="btn_gen_rels_ui", disabled=(not can_suggest_rels)): # Unique key
+                    char_name_active = st.session_state.active_char_for_display
+                    st.info(f"Generating relationship suggestions for {char_name_active} via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/characters/{char_name_active}/suggest-relationships")
+
+                    if "error" not in response_data:
+                         if "characters" in st.session_state.project_state and char_name_active in st.session_state.project_state["characters"]:
+                             st.session_state.project_state["characters"][char_name_active]["relationship_suggestions"] = response_data.get("text", "")
+                             st.success(f"Relationship suggestions generated for {char_name_active}.")
+                             st.rerun()
+                         else:
+                              st.error(f"API returned success but character '{char_name_active}' state not found locally after update attempt.")
+
+
+                rel_sugg = active_char_data_for_display.get("relationship_suggestions", "*No relationship suggestions generated yet.*")
+                st.markdown(rel_sugg)
+
+
+        # --- Tab 3: Screenwriting ---
+        with tab3:
+            st.header("Screenwriting")
+            st.markdown("Write your screenplay.")
+
+            current_script_state = get_state().get("script", {})
+
+            col1, col2 = st.columns(2)
+            with col1:
+                can_generate_outline = (
+                     get_state().get("concept", {}).get("final_synopsis")
+                     or get_state().get("concept", {}).get("chosen_logline")
+                )
+                if st.button("Generate Outline from Synopsis", key="btn_gen_outline_ui", disabled=(not can_generate_outline)): # Unique key
+                    st.info("Generating script outline via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/script/generate-outline")
+
+                    if "error" not in response_data:
+                        if "script" in st.session_state.project_state:
+                             st.session_state.project_state["script"]["outline_md"] = response_data.get("text", "")
+                             st.success("Outline generated.")
+                             st.rerun()
+                        else:
+                             st.error("API returned success but script state not found locally.")
+
+                st.markdown("**Generated Outline:**")
+                st.markdown(current_script_state.get("outline_md", "*No outline generated yet.*"))
+
+            with col2:
+                st.subheader("Draft Scene")
+                scene_heading = st.text_input("Scene Heading", placeholder="INT. LOCATION - DAY/NIGHT", key="scene_head_ui") # Unique key
+                scene_desc = st.text_area("Scene Description/Goal", key="scene_desc_ui") # Unique key
+                scene_context = st.text_input("Character Context (Optional)", key="scene_context_ui") # Unique key
+                scene_tone = st.text_input("Scene Tone (Optional)", key="scene_tone_ui") # Unique key
+
+
+                if st.button("Draft Scene", key="btn_draft_scene_ui"): # Unique key
+                     heading_val = st.session_state.scene_head_ui
+                     desc_val = st.session_state.scene_desc_ui
+                     context_val = st.session_state.scene_context_ui
+                     tone_val = st.session_state.scene_tone_ui
+
+                     if heading_val and desc_val:
+                          st.info(f"Drafting scene '{heading_val}' via API...")
+                          draft_request_data = {
+                              "scene_heading": heading_val,
+                              "scene_description": desc_val,
+                              "character_context": context_val,
+                              "tone": tone_val
+                          }
+                          response_data = call_api("POST", f"/projects/{get_state()['project_name']}/script/draft-scene", json_data=draft_request_data)
+
+                          if "error" not in response_data:
+                               st.session_state.temp_drafted_scene = response_data.get("text", "")
+                               st.success("Scene drafted.")
+                               st.rerun()
+                     else:
+                          st.warning("Scene Heading and Description are required.")
+
+                st.text_area(
+                    "Drafted Scene Output",
+                    value=st.session_state.temp_drafted_scene,
+                    height=200,
+                    key="drafted_scene_disp_ui", # Unique key
+                    help="Copy from here",
+                    disabled=True
+                )
+
+
+            st.markdown("---")
+            st.subheader("Full Script Draft")
+
+            full_script_content = st.text_area(
+                "Script Content (.fountain format recommended)",
+                value=current_script_state.get("full_script_content", ""),
+                height=600,
+                key="script_editor_main_ui"
+            )
+
+            if st.button("Save Full Script Content", key="btn_save_full_script_ui"): # Unique key
+                 st.info("Saving full script content via API...")
+                 script_to_save = st.session_state.script_editor_main_ui
+                 response_data = call_api("PUT", f"/projects/{get_state()['project_name']}/script/full-script", json_data={"full_script_content": script_to_save})
+                 if "error" not in response_data:
+                      st.session_state.project_state["script"]["full_script_content"] = script_to_save
+                      st.success("Full script content saved.")
+
+            col_refine, col_analyze = st.columns(2)
+            with col_refine:
+                st.markdown("**Refine Text:**")
+                text_to_refine = st.text_area("Paste Dialogue or Action Line to Refine", height=100, key="refine_input_text_ui") # Unique key
+                refine_instruction = st.text_input("Refinement Instruction", placeholder="e.g., 'Make dialogue tense' or 'Make action concise'", key="refine_instr_ui") # Unique key
+
+                if st.button("Refine Text", key="btn_refine_ui"): # Unique key
+                     refine_text_val = st.session_state.refine_input_text_ui
+                     instruction_val = st.session_state.refine_instr_ui
+
+                     if refine_text_val and instruction_val:
+                         st.info("Refining text via API...")
+                         refine_request_data = {
+                             "text_to_refine": refine_text_val,
+                             "instruction": instruction_val
+                         }
+                         response_data = call_api("POST", f"/projects/{get_state()['project_name']}/script/refine-text", json_data=refine_request_data)
+
+                         if "error" not in response_data:
+                              st.session_state.temp_refined_text = response_data.get("text", "")
+                              st.success("Text refined.")
+                              st.rerun()
+                     else:
+                         st.warning("Text and instruction required for refinement.")
+
+                st.text_area(
+                    "Refined Text Output",
+                    value=st.session_state.temp_refined_text,
+                    height=100,
+                    key="refined_text_disp_ui", # Unique key
+                    help="Copy from here",
+                    disabled=True
+                )
+
+            with col_analyze:
+                st.markdown("**Analyze Script Issues:**")
+                can_analyze = len(get_state().get("script", {}).get("full_script_content", "")) >= 50
+                if st.button("Analyze Script Issues (Last ~2000 Chars)", key="btn_analyze_ui", disabled=(not can_analyze)): # Unique key
+                    st.info("Analyzing script via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/script/analyze-issues")
+
+                    if "error" not in response_data:
+                        if "script" in st.session_state.project_state:
+                             st.session_state.project_state["script"]["analysis_md"] = response_data.get("text", "")
+                             st.success("Script analysis complete.")
+                             st.rerun()
+                        else:
+                             st.error("API returned success but script state not found locally.")
+
+                st.markdown(current_script_state.get("analysis_md", "*No analysis performed yet.*"))
+
+        # --- Tab 4: Pre-Production Ideas ---
+        with tab4:
+            st.header("Pre-Production Ideas")
+            st.markdown("Generate visual ideas based on your script and concept.")
+
+            current_preprod_state = get_state().get("pre_production", {})
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Moodboard Ideas")
+                can_generate_moodboard = (
+                     get_state().get("concept", {}).get("chosen_theme")
+                     or get_state().get("concept", {}).get("seed_idea")
+                     or get_state().get("concept", {}).get("final_synopsis")
+                )
+                if st.button("Generate Moodboard Ideas", key="btn_gen_mood_ui", disabled=(not can_generate_moodboard)): # Unique key
+                    st.info("Generating moodboard ideas and images via API...")
+                    response_data = call_api("POST", f"/projects/{get_state()['project_name']}/preproduction/generate-moodboard-ideas")
+
+                    if "error" not in response_data:
+                         if "pre_production" in st.session_state.project_state:
+                            # The API saves state (text ideas and images), but returns only the image parts.
+                            # We need to re-fetch the state to get the updated text ideas markdown and ensure images are fully synced.
+                            # Update images immediately for responsiveness
+                            st.session_state.project_state["pre_production"]["moodboard_images"] = response_data.get("parts", [])
+                            st.success("Moodboard ideas generated.")
+                            load_project_api(get_state()['project_name']) # Re-load state to get latest text ideas and trigger rerun
+                         else:
+                              st.error("API returned success but pre_production state not found locally.")
+
+
+                st.markdown("**Generated Moodboard Text Ideas:**")
+                st.markdown(current_preprod_state.get("moodboard_ideas_md", "*No moodboard text ideas generated yet.*"))
+
+                # Display generated images
+                moodboard_image_parts = current_preprod_state.get("moodboard_images", [])
+                if moodboard_image_parts:
+                    st.markdown("**Generated Moodboard Images:**")
+                    for i, part in enumerate(moodboard_image_parts):
+                        if part.get("type", "").startswith("image/"):
+                            try:
+                                img_bytes = base64.b64decode(part.get("content"))
+                                img = Image.open(io.BytesIO(img_bytes))
+                                st.image(img, caption=f"Image {i+1}", use_column_width=True) # Added caption
+                            except Exception as e:
+                                st.warning(f"Failed to display image part {i+1}: {e}")
+                        elif part.get("type") == "text":
+                            st.write(f"**Text Part {i+1}:**")
+                            st.markdown(part.get("content"))
+                        elif part.get("type") == "error":
+                            st.error(f"Image generation part {i+1} failed: {part.get('content')}")
+                        else:
+                            st.warning(f"Skipping unknown part type {i+1}: {part.get('type')}")
+
+
+            with col2:
+                st.subheader("Storyboard Shot Ideas")
+
+                # FIX: Clear input text area using flag
+                if st.session_state.clear_sb_input_flag:
+                    st.session_state.sb_scene_input_ui = "" # Clear the value tied to the key
+                    st.session_state.clear_sb_input_flag = False # Reset the flag
+
+                scene_text_for_sb = st.text_area(
+                    "Paste Scene Text Here",
+                    value=st.session_state.get("sb_scene_input_ui", ""), # Use .get for safe initial read
+                    height=200,
+                    key="sb_scene_input_ui" # Unique key
+                )
+                # END FIX
+
+                can_generate_storyboard = len(st.session_state.get("sb_scene_input_ui", "").strip()) >= 50 # Needs sufficient length
+                if st.button("Generate Storyboard Ideas", key="btn_gen_sb_ui", disabled=(not can_generate_storyboard)): # Unique key
+                    scene_text_val = st.session_state.sb_scene_input_ui # Read value via key
+
+                    if scene_text_val.strip():
+                        st.info("Generating storyboard ideas and images via API...")
+                        response_data = call_api("POST", f"/projects/{get_state()['project_name']}/preproduction/generate-storyboard-ideas", json_data={"scene_text": scene_text_val})
+
+                        if "error" not in response_data:
+                             if "pre_production" in st.session_state.project_state:
+                                 # API saves state (text ideas and images), but returns only the image parts.
+                                 # We need to re-fetch the state to get the updated text ideas markdown and ensure images are fully synced.
+                                 # Update images immediately for responsiveness
+                                 st.session_state.project_state["pre_production"]["storyboard_images"] = response_data.get("parts", [])
+                                 st.success("Storyboard ideas generated.")
+                                 # Set the clearing flag instead of writing directly
+                                 st.session_state.clear_sb_input_flag = True
+                                 load_project_api(get_state()['project_name']) # Re-load state to get latest text ideas and trigger rerun
+                             else:
+                                  st.error("API returned success but pre_production state not found locally.")
+
+                    else:
+                        st.warning("Please paste scene text.")
+
+                st.markdown("**Generated Storyboard Text Ideas:**")
+                st.markdown(current_preprod_state.get("storyboard_ideas_md", "*No storyboard text ideas generated yet.*"))
+
+                # Display generated images
+                storyboard_image_parts = current_preprod_state.get("storyboard_images", [])
+                if storyboard_image_parts:
+                    st.markdown("**Generated Storyboard Images:**")
+                    for i, part in enumerate(storyboard_image_parts):
+                        if part.get("type", "").startswith("image/"):
+                            try:
+                                img_bytes = base64.b64decode(part.get("content"))
+                                img = Image.open(io.BytesIO(img_bytes))
+                                st.image(img, caption=f"Image {i+1}", use_column_width=True) # Added caption
+                            except Exception as e:
+                                st.warning(f"Failed to display image part {i+1}: {e}")
+                        elif part.get("type") == "text":
+                            st.write(f"**Text Part {i+1}:**")
+                            st.markdown(part.get("content"))
+                        elif part.get("type") == "error":
+                            st.error(f"Image generation part {i+1} failed: {part.get('content')}")
+                        else:
+                            st.warning(f"Skipping unknown part type {i+1}: {part.get('type')}")
+
+
+        # --- Tab 5: Log ---
+        with tab5:
+            st.header("Action Log")
+            log_content = "\n".join(get_state().get("log", ["Log is empty."]))
+            st.text_area("Log", value=log_content, height=600, disabled=True, key="log_display_area_ui") # Unique key
+
+# --- Final check or message if API URL seems off (Optional) ---
+# You could add a visual indicator if API calls consistently fail or latency is high

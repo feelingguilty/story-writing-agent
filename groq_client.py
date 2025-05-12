@@ -10,19 +10,6 @@ else:
     print("Groq client not initialized due to missing API key.")
 
 def call_groq(prompt: str, system_prompt: str = "You are a helpful AI assistant.", model: str = config.DEFAULT_MODEL, max_retries: int = 3, initial_delay: int = 5) -> str:
-    """
-    Calls the Groq API with retry logic for rate limiting.
-
-    Args:
-        prompt: The user's prompt.
-        system_prompt: The system message to set the AI's role.
-        model: The Groq model to use.
-        max_retries: Maximum number of retries on rate limit errors.
-        initial_delay: Initial delay in seconds before retrying.
-
-    Returns:
-        The AI's response content as a string, or an error message prefixed with "Error:".
-    """
     if not groq_client:
         return "Error: Groq API key not configured."
 
